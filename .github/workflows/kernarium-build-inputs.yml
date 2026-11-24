@@ -5,7 +5,7 @@ name: Build Kernarium runtime inputs
 on:
   workflow_dispatch:
   push:
-    branches: [ci/kernarium-inputs]
+    branches: [ci/kernarium-inputs, ci/kernarium-kernel]
     paths:
       - .github/workflows/kernarium-build-inputs.yml
       - tools/rootfs/starter/**
@@ -30,23 +30,45 @@ jobs:
             printf '%s/bin\n' "$(brew --prefix "$formula")" >> "$GITHUB_PATH"
           done
 
-      - name: Prepare the kernel and pinned host dependencies
+      - name: Set up the case-sensitive kernel workspace
         run: |
           set -euo pipefail
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          hdiutil create -size 20g -type SPARSE -fs APFSX -volname KernariumKernel \
-            "$RUNNER_TEMP/kernarium-kernel.sparseimage"
-          mkdir "$RUNNER_TEMP/kernel-volume"
-          hdiutil attach -nobrowse -mountpoint "$RUNNER_TEMP/kernel-volume" \
-            "$RUNNER_TEMP/kernarium-kernel.sparseimage"
-          kernel_volume=$(cd "$RUNNER_TEMP/kernel-volume" && pwd -P)
+          log="$RUNNER_TEMP/kernel-volume.log"
+          trap 'details=$(tail -n 5 "$log" | paste -sd " " -); printf "::error::Kernel volume setup: %s\n" "$details"' ERR
+          kernel_volume="$RUNNER_TEMP/kernel-volume"
+          mkdir "$kernel_volume"
+          touch "$kernel_volume/case-probe"
+          if [[ -e "$kernel_volume/CASE-PROBE" ]]; then
+            rm "$kernel_volume/case-probe"
+            image="$RUNNER_TEMP/kernarium-kernel.sparseimage"
+            hdiutil create -size 20g -type SPARSE -fs 'Case-sensitive APFS' \
+              -volname KernariumKernel "$image" > "$log" 2>&1
+            hdiutil attach -nobrowse -mountpoint "$kernel_volume" "$image" >> "$log" 2>&1
+          else
+            rm "$kernel_volume/case-probe"
+          fi
+          kernel_volume=$(cd "$kernel_volume" && pwd -P)
           printf 'UML_KERNEL_SOURCE_DIR=%s/linux\n' "$kernel_volume" \
             > "$RUNNER_TEMP/source-location.conf"
           echo "UML_KERNEL_SOURCE_CONFIG=$RUNNER_TEMP/source-location.conf" >> "$GITHUB_ENV"
           echo "KERNEL_BUILD_DIR=$kernel_volume/build" >> "$GITHUB_ENV"
-          UML_KERNEL_SOURCE_CONFIG="$RUNNER_TEMP/source-location.conf" \
-            kernel/mainline-6.18/scripts/prepare-source.sh --cache "$kernel_volume/cache"
+          echo "KERNEL_CACHE_DIR=$kernel_volume/cache" >> "$GITHUB_ENV"
+
+      - name: Replay the pinned Linux sources
+        run: |
+          set -euo pipefail
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          kernel/mainline-6.18/scripts/prepare-source.sh --cache "$KERNEL_CACHE_DIR" \
+            2>&1 | tee "$RUNNER_TEMP/kernel-source.log" || {
+              details=$(tail -n 5 "$RUNNER_TEMP/kernel-source.log" | paste -sd ' ' -)
+              printf '::error::Kernel source preparation: %s\n' "$details"
+              exit 1
+            }
+
+      - name: Build the pinned kernel host dependencies
+        run: |
+          set -euo pipefail
           dependencies/prepare.sh --product kernel-host-tools
           dependencies/prepare.sh --archive-manifest dependencies/kernel-host-tools/archives.tsv
           dependencies/build-kernel-host-tools.sh
@@ -73,6 +95,7 @@ jobs:
           compression-level: 0
 
   android-kernel:
+    if: github.ref_name != 'ci/kernarium-kernel'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -110,6 +133,7 @@ jobs:
           compression-level: 0
 
   boot-base:
+    if: github.ref_name != 'ci/kernarium-kernel'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 150
     steps:
@@ -150,6 +174,7 @@ jobs:
           compression-level: 0
 
   debian:
+    if: github.ref_name != 'ci/kernarium-kernel'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
     env:
