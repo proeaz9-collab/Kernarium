@@ -26,6 +26,7 @@ DEBIAN_IMAGES = {
     "debian-13-minimal": "debian-13-minimal.img",
     "debian-13-plasma-wayland": "debian-13-plasma-wayland.img",
     "debian-13-minimal-armhf": "debian-13-minimal-armhf.img",
+    "debian-13-developer-erofs": "debian-13-developer.erofs",
 }
 PRODUCTS = ("boot-base-aarch64", "boot-base-x86_64", "alpine",
             *DEBIAN_IMAGES)
@@ -146,6 +147,7 @@ def main() -> int:
             disk = inspect(path)
             disk.pop("image", None)
             entry["disk"] = disk
+        if path.suffix in (".img", ".erofs"):
             inventory = sidecar(output, f"{name}.packages.tsv",
                                 "package inventory")
             if name == DEBIAN_IMAGES["debian-13-minimal-armhf"]:
@@ -154,6 +156,8 @@ def main() -> int:
                 entry["architecture"] = "armhf"
                 entry["elf_audit"] = elf_audit(output, name)
             entry["package_inventory"] = inventory
+        if path.suffix == ".erofs":
+            entry["architecture"] = "aarch64"
         products_manifest[name] = entry
     manifest = {
         "schema_version": 1,

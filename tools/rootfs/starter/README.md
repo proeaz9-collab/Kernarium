@@ -67,6 +67,14 @@ Plasma session are the image's, and the launcher adds no setup. Its `--help`
 owns the explicit legacy-image options; a legacy ext4 derivative of the unified
 EROFS image keeps that image's [seed](../boot-ramdisk/README.md#harness-session).
 
+## Debian developer image
+
+The optional `debian-13-developer-erofs` product packages the Debian 13
+Plasma session, Konsole and Blender as a read-only EROFS root for Kernarium.
+It requires erofs-utils on the build host. Pass `--code-deb` with an official
+ARM64 VS Code package to add the editor. Kernarium uses its normal Linux
+overlay above the image.
+
 ## The armhf image
 
 `debian-13-minimal-armhf.img` is built only on request

@@ -23,7 +23,7 @@ DEBIAN_MIRROR=http://deb.debian.org/debian
 # provides. --exclude cannot drop it, because the dependency pulls it back.
 ARMHF_INCLUDE=systemd-sysv,systemd-resolved,udev,kmod,dbus,ca-certificates,libbpf1
 DEFAULT_PRODUCTS="boot-base-aarch64 boot-base-x86_64 alpine debian-13-minimal debian-13-plasma-wayland"
-KNOWN_PRODUCTS="$DEFAULT_PRODUCTS debian-13-minimal-armhf"
+KNOWN_PRODUCTS="$DEFAULT_PRODUCTS debian-13-minimal-armhf debian-13-developer-erofs"
 
 fail()
 {
@@ -35,7 +35,7 @@ usage()
 {
 	cat <<'EOF'
 Usage: tools/rootfs/starter/build-all.sh --work PATH --output PATH [--jobs N]
-       [--product NAME]...
+       [--product NAME]... [--code-deb FILE]
 
 Run as an ordinary user with passwordless sudo on native arm64 Linux. PATHs
 must be absolute and distinct outside the source tree. The output path must
@@ -44,7 +44,9 @@ not exist; the completed release directory is published atomically.
 --product builds only the named products, each at most once; by default the
 release holds every product but the armhf one:
   boot-base-aarch64 boot-base-x86_64 alpine debian-13-minimal
-  debian-13-plasma-wayland debian-13-minimal-armhf
+  debian-13-plasma-wayland debian-13-minimal-armhf debian-13-developer-erofs
+
+--code-deb adds a local official VS Code package to the developer image.
 
 debian-13-minimal-armhf runs ARM programs under qemu-arm (Debian's qemu-user)
 in private namespaces.
@@ -54,6 +56,7 @@ EOF
 . "$SCRIPT_DIR/../producer.sh"
 work_dir=
 output_dir=
+code_deb=
 jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1\n')
 products=
 while [ "$#" -gt 0 ]; do
@@ -66,6 +69,11 @@ while [ "$#" -gt 0 ]; do
 	--output)
 		[ "$#" -ge 2 ] || fail "--output requires a path"
 		output_dir=$2
+		shift 2
+		;;
+	--code-deb)
+		[ "$#" -ge 2 ] || fail "--code-deb requires a path"
+		code_deb=$2
 		shift 2
 		;;
 	--jobs)
@@ -114,6 +122,17 @@ wants()
 
 producer_require_host aarch64 chroot cpio curl debootstrap e2fsck gzip make \
 	mkfs.ext4 python3 resize2fs sgdisk sha256sum sudo tar
+if wants debian-13-developer-erofs; then
+	command -v mkfs.erofs >/dev/null && command -v fsck.erofs >/dev/null ||
+		fail "the developer image requires erofs-utils"
+elif [ -n "$code_deb" ]; then
+	fail "--code-deb requires --product debian-13-developer-erofs"
+fi
+if [ -n "$code_deb" ]; then
+	[ -f "$code_deb" ] && [ "$(dpkg-deb -f "$code_deb" Package)" = code ] &&
+		[ "$(dpkg-deb -f "$code_deb" Architecture)" = arm64 ] ||
+		fail "--code-deb must name an ARM64 VS Code .deb"
+fi
 if wants debian-13-minimal-armhf; then
 	sudo -n -- sh "$SCRIPT_DIR/armhf-run.sh" --check
 fi
@@ -676,25 +695,45 @@ EOF
 
 build_debian_plasma()
 {
-	printf '%s\n' "==> Building Debian 13 minimal Plasma Wayland GPT image"
-	root=$roots_dir/debian-plasma
+	product=$1
+	printf '%s\n' "==> Building $product"
+	root=$roots_dir/$product
 	debootstrap_root "$root"
 	mount_chroot_proc "$root"
 	prepare_debian_base "$root"
 	install_debian_base "$root"
 	configure_debian_base "$root" debian debian
 	configure_plasma_user "$root"
-	as_root chroot "$root" dpkg-query -W -f='${binary:Package}\t${Version}\n' | \
-		sort > "$work_dir/debian-plasma.packages.tsv"
+
+	if [ "$product" = debian-13-developer-erofs ]; then
+		set -- blender
+		if [ -n "$code_deb" ]; then
+			as_root install -m 0644 "$code_deb" "$root/tmp/kernarium-code.deb"
+			set -- "$@" /tmp/kernarium-code.deb
+		fi
+		as_root chroot "$root" /usr/bin/env DEBIAN_FRONTEND=noninteractive \
+			apt-get install -y --no-install-recommends "$@"
+	fi
+
+	inventory=$work_dir/$product.packages.tsv
+	as_root chroot "$root" dpkg-query -W -f='${binary:Package}\t${Version}\n' |
+		sort > "$inventory"
 	unmount_chroot_proc
 	cat "$root/etc/debian_version" > "$work_dir/debian.version"
 	prune_debian "$root"
-	destination=$(artifact_path debian-13-plasma-wayland.img)
-	as_root python3 "$SCRIPT_DIR/make-gpt-image.py" \
-		--root "$root" --output "$destination" --label debian-kde \
-		--headroom-mib 256
+
+	if [ "$product" = debian-13-developer-erofs ]; then
+		destination=$(artifact_path "debian-13-developer.erofs")
+		as_root mkfs.erofs -zlz4hc "$destination" "$root"
+		as_root fsck.erofs "$destination"
+	else
+		destination=$(artifact_path "debian-13-plasma-wayland.img")
+		as_root python3 "$SCRIPT_DIR/make-gpt-image.py" \
+			--root "$root" --output "$destination" --label debian-kde \
+			--headroom-mib 256
+	fi
 	as_root chown "$owner_uid:$owner_gid" "$destination"
-	cp "$work_dir/debian-plasma.packages.tsv" "$destination.packages.tsv"
+	cp "$inventory" "$destination.packages.tsv"
 }
 
 # The armhf twin of debian-13-minimal. debootstrap's first stage only
@@ -771,7 +810,10 @@ if wants debian-13-minimal; then
 	build_debian_minimal
 fi
 if wants debian-13-plasma-wayland; then
-	build_debian_plasma
+	build_debian_plasma debian-13-plasma-wayland
+fi
+if wants debian-13-developer-erofs; then
+	build_debian_plasma debian-13-developer-erofs
 fi
 if wants debian-13-minimal-armhf; then
 	build_debian_minimal_armhf
@@ -800,7 +842,7 @@ if wants alpine; then
 		--alpine-sha256 "$ALPINE_SHA256"
 fi
 if wants debian-13-minimal || wants debian-13-plasma-wayland || \
-	wants debian-13-minimal-armhf; then
+	wants debian-13-minimal-armhf || wants debian-13-developer-erofs; then
 	set -- "$@" --debian-suite "$DEBIAN_SUITE" \
 		--debian-version "$(cat "$work_dir/debian.version")"
 fi

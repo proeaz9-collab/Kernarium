@@ -1,0 +1,190 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+name: Build Kernarium runtime inputs
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/kernarium-inputs]
+    paths:
+      - .github/workflows/kernarium-build-inputs.yml
+      - tools/rootfs/starter/**
+
+permissions:
+  contents: read
+
+jobs:
+  kernel:
+    runs-on: xcode-27
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install kernel build tools
+        run: |
+          set -euo pipefail
+          brew install llvm lld make bison flex cmake meson ninja autoconf automake libtool
+          for formula in llvm lld make bison flex; do
+            printf '%s/bin\n' "$(brew --prefix "$formula")" >> "$GITHUB_PATH"
+          done
+
+      - name: Prepare the kernel and pinned host dependencies
+        run: |
+          set -euo pipefail
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          hdiutil create -size 20g -type SPARSE -fs APFSX -volname KernariumKernel \
+            "$RUNNER_TEMP/kernarium-kernel.sparseimage"
+          mkdir "$RUNNER_TEMP/kernel-volume"
+          hdiutil attach -nobrowse -mountpoint "$RUNNER_TEMP/kernel-volume" \
+            "$RUNNER_TEMP/kernarium-kernel.sparseimage"
+          kernel_volume=$(cd "$RUNNER_TEMP/kernel-volume" && pwd -P)
+          printf 'UML_KERNEL_SOURCE_DIR=%s/linux\n' "$kernel_volume" \
+            > "$RUNNER_TEMP/source-location.conf"
+          echo "UML_KERNEL_SOURCE_CONFIG=$RUNNER_TEMP/source-location.conf" >> "$GITHUB_ENV"
+          echo "KERNEL_BUILD_DIR=$kernel_volume/build" >> "$GITHUB_ENV"
+          UML_KERNEL_SOURCE_CONFIG="$RUNNER_TEMP/source-location.conf" \
+            kernel/mainline-6.18/scripts/prepare-source.sh --cache "$kernel_volume/cache"
+          dependencies/prepare.sh --product kernel-host-tools
+          dependencies/prepare.sh --archive-manifest dependencies/kernel-host-tools/archives.tsv
+          dependencies/build-kernel-host-tools.sh
+
+      - name: Build and publish the kernel artifact
+        run: |
+          set -euo pipefail
+          kernel/mainline-6.18/build/build-kernel.sh --slice arm64 \
+            --product linux --build "$KERNEL_BUILD_DIR"
+          source_dir=$(kernel/mainline-6.18/scripts/source-location.sh --require-source)
+          kernel/mainline-6.18/build/publish-artifact.py --source "$source_dir" \
+            --build "$KERNEL_BUILD_DIR" --product linux \
+            --output-root "$RUNNER_TEMP/kernel-artifacts" \
+            --release-id "actions-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --objcopy "$(command -v llvm-objcopy)"
+          tar -czf "$RUNNER_TEMP/kernel-linux.tar.gz" \
+            -C "$RUNNER_TEMP" kernel-artifacts
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: kernel-linux-arm64
+          path: ${{ runner.temp }}/kernel-linux.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  android-kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Verify the upstream Android kernel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          descriptor="$PWD/kernel/mainline-6.18/artifacts/accepted-android-4k.env"
+          source "$descriptor"
+          name="$UML_KERNEL_ARTIFACT_DIRECTORY_NAME.tar.gz"
+          gh release download andarium-1.1 --repo imxieyi/Kernarium \
+            --pattern "$name" --dir "$RUNNER_TEMP"
+          printf '%s  %s\n' 128d0948d6989e7d1cd03edc5f1c1218d0dd2fac99c7bb960897c64019e38196 \
+            "$RUNNER_TEMP/$name" | sha256sum --check
+          artifacts="$RUNNER_TEMP/kernel-artifacts"
+          mkdir -p "$artifacts"
+          tar -xzf "$RUNNER_TEMP/$name" -C "$artifacts"
+          python3 -B kernel/common/artifacts/verify-kernel-artifact.py \
+            --artifact "$artifacts/$UML_KERNEL_ARTIFACT_DIRECTORY_NAME" \
+            --common-root "$PWD/kernel/common" --abi-metadata "$PWD/kernel/common/abi/identity.env" \
+            --compatible --expected-family android-6.18 --expected-slice arm64 \
+            --expected-release-series 6.18 --descriptor "$descriptor"
+          tar -czf "$RUNNER_TEMP/kernel-android.tar.gz" -C "$RUNNER_TEMP" kernel-artifacts
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: kernel-android-arm64
+          path: ${{ runner.temp }}/kernel-android.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  boot-base:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential cpio debootstrap e2fsprogs \
+            file flex gawk gdisk libncurses-dev patch rsync unzip wget
+
+      - name: Build the ARM64 boot base
+        run: |
+          set -euo pipefail
+          tools/rootfs/starter/build-all.sh --work "$RUNNER_TEMP/starter-work" \
+            --output "$RUNNER_TEMP/boot-base" --product boot-base-aarch64
+          archive="$RUNNER_TEMP/boot-base/uml-boot-base-aarch64.cpio.gz"
+          descriptor="$RUNNER_TEMP/boot-base/accepted-aarch64.env"
+          {
+            echo '# SPDX-License-Identifier: GPL-2.0-or-later'
+            echo 'UML_BOOT_BASE_SCHEMA=1'
+            printf "UML_BOOT_BASE_RELEASE='starter-actions-%s-%s'\n" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            echo "UML_BOOT_BASE_FILE='uml-boot-base-aarch64.cpio.gz'"
+            echo "UML_BOOT_BASE_ARCHITECTURE='aarch64'"
+            printf 'UML_BOOT_BASE_SIZE=%s\n' "$(stat -c %s "$archive")"
+            printf "UML_BOOT_BASE_SHA256='%s'\n" "$(sha256sum "$archive" | cut -d ' ' -f 1)"
+          } > "$descriptor"
+          python3 tools/rootfs/boot-ramdisk/verify_base.py \
+            --descriptor "$descriptor" --archive "$archive"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: boot-base-aarch64
+          path: ${{ runner.temp }}/boot-base/
+          if-no-files-found: error
+          compression-level: 0
+
+  debian:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      CODE_DEB_URL: ${{ vars.KERNARIUM_CODE_DEB_URL }}
+      CODE_DEB_SHA256: ${{ vars.KERNARIUM_CODE_DEB_SHA256 }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install image tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cpio debootstrap e2fsprogs erofs-utils gdisk
+
+      - name: Build Debian 13 developer image
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ -n "$CODE_DEB_URL$CODE_DEB_SHA256" ]]; then
+            [[ "$CODE_DEB_URL" == https://* ]]
+            [[ "$CODE_DEB_SHA256" =~ ^[0-9a-f]{64}$ ]]
+            code_deb="$RUNNER_TEMP/code-arm64.deb"
+            curl --fail --silent --show-error --location --proto '=https' \
+              --proto-redir '=https' --retry 3 --max-time 600 \
+              --output "$code_deb" -- "$CODE_DEB_URL"
+            printf '%s  %s\n' "$CODE_DEB_SHA256" "$code_deb" | sha256sum --check
+            args+=(--code-deb "$code_deb")
+          fi
+          tools/rootfs/starter/build-all.sh --work "$RUNNER_TEMP/debian-work" \
+            --output "$RUNNER_TEMP/debian" --product debian-13-developer-erofs "${args[@]}"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: debian-13-developer-arm64
+          path: ${{ runner.temp }}/debian/
+          if-no-files-found: error
+          compression-level: 0
