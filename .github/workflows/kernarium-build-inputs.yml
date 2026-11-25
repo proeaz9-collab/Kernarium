@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   kernel:
-    runs-on: xcode-27
+    runs-on: macos-26
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v6
@@ -34,6 +34,7 @@ jobs:
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/kernel-volume.log"
+          : > "$log"
           trap 'details=$(tail -n 5 "$log" | paste -sd " " -); printf "::error::Kernel volume setup: %s\n" "$details"' ERR
           kernel_volume="$RUNNER_TEMP/kernel-volume"
           mkdir "$kernel_volume"
