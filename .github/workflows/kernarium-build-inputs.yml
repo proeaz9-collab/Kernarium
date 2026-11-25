@@ -75,6 +75,8 @@ jobs:
           dependencies/build-kernel-host-tools.sh
 
       - name: Build and publish the kernel artifact
+        env:
+          UML_KERNEL_EXTRA_HOST_CFLAGS: -Wno-macro-redefined
         run: |
           set -euo pipefail
           kernel/mainline-6.18/build/build-kernel.sh --slice arm64 \
